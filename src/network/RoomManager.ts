@@ -10,9 +10,16 @@ export class RoomManager {
   private localStream: MediaStream | null = null;
   private activePeers: Set<string> = new Set();
   private peerUsernames: Map<string, string> = new Map();
+  private peerLastSeen: Map<string, number> = new Map();
   private myUsername: string;
   
   private MAX_PEERS = 8;
+  private HEARTBEAT_INTERVAL_MS = 3000;
+  private STALE_TIMEOUT_MS = 9000;
+  
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private staleCheckTimer: ReturnType<typeof setInterval> | null = null;
+  private isDisconnected: boolean = false;
   
   public onData?: (data: PeerMessage) => void;
   public onPeersChange?: (peers: RemotePeer[]) => void;
@@ -22,6 +29,7 @@ export class RoomManager {
   constructor(roomId: string, username: string) {
     this.roomId = roomId;
     this.myUsername = username;
+    this.handleUnload = this.handleUnload.bind(this);
   }
 
   public async connect(): Promise<void> {
@@ -31,10 +39,13 @@ export class RoomManager {
       console.warn("Microphone not available or denied:", err);
     }
 
+    window.addEventListener('beforeunload', this.handleUnload);
     this.tryConnectIndex(1);
   }
 
-  private isDisconnected: boolean = false;
+  private handleUnload() {
+    this.disconnect();
+  }
 
   private tryConnectIndex(index: number) {
     if (this.isDisconnected) return;
@@ -58,6 +69,7 @@ export class RoomManager {
       
       this.setupListeners();
       this.connectToOtherPeers();
+      this.startHeartbeat();
     });
 
     newPeer.on('error', (err: any) => {
@@ -79,11 +91,9 @@ export class RoomManager {
     });
 
     this.peer.on('call', (call) => {
-      // Answer with our stream
       if (this.localStream) {
         call.answer(this.localStream);
       } else {
-        // Create an empty audio track if no mic to satisfy PeerJS expectations
         const ctx = new AudioContext();
         const dest = ctx.createMediaStreamDestination();
         call.answer(dest.stream);
@@ -114,9 +124,18 @@ export class RoomManager {
   }
 
   private setupDataConnection(conn: DataConnection) {
+    // If we already have a data connection to this peer, clean up the old one
+    if (this.dataConnections.has(conn.peer)) {
+      const oldConn = this.dataConnections.get(conn.peer);
+      if (oldConn && oldConn !== conn) {
+        try { oldConn.close(); } catch (_) {}
+      }
+    }
+
     conn.on('open', () => {
       this.dataConnections.set(conn.peer, conn);
       this.activePeers.add(conn.peer);
+      this.peerLastSeen.set(conn.peer, Date.now());
       this.emitPeersChange();
       // Send our username to the new peer
       conn.send({ type: 'ANNOUNCE', username: this.myUsername });
@@ -124,9 +143,16 @@ export class RoomManager {
 
     conn.on('data', (data: any) => {
       const msg = data as PeerMessage;
+      this.peerLastSeen.set(conn.peer, Date.now());
+
       if (msg.type === 'ANNOUNCE') {
         this.peerUsernames.set(conn.peer, msg.username);
+        this.activePeers.add(conn.peer);
         this.emitPeersChange();
+      } else if (msg.type === 'LEAVE') {
+        this.handlePeerLeave(msg.peerId || conn.peer);
+      } else if (msg.type === 'HEARTBEAT') {
+        // Keeps peerLastSeen updated
       } else {
         this.onData?.(msg);
       }
@@ -137,6 +163,14 @@ export class RoomManager {
   }
 
   private setupMediaConnection(call: MediaConnection) {
+    // If we already have a media connection to this peer, clean up the old one
+    if (this.mediaConnections.has(call.peer)) {
+      const oldCall = this.mediaConnections.get(call.peer);
+      if (oldCall && oldCall !== call) {
+        try { oldCall.close(); } catch (_) {}
+      }
+    }
+
     this.mediaConnections.set(call.peer, call);
     
     call.on('stream', (_remoteStream) => {
@@ -149,20 +183,68 @@ export class RoomManager {
   }
 
   private handlePeerLeave(peerId: string) {
+    let changed = false;
     if (this.dataConnections.has(peerId)) {
-      this.dataConnections.get(peerId)?.close();
+      const conn = this.dataConnections.get(peerId);
+      try { conn?.close(); } catch (_) {}
       this.dataConnections.delete(peerId);
+      changed = true;
     }
     if (this.mediaConnections.has(peerId)) {
-      this.mediaConnections.get(peerId)?.close();
+      const call = this.mediaConnections.get(peerId);
+      try { call?.close(); } catch (_) {}
       this.mediaConnections.delete(peerId);
+      changed = true;
     }
-    this.activePeers.delete(peerId);
-    this.peerUsernames.delete(peerId);
-    this.emitPeersChange();
-    
-    // Periodically try to reconnect to empty slots to catch late joiners
-    // Handled by the fact that the new joiner will connect to us
+    if (this.activePeers.has(peerId)) {
+      this.activePeers.delete(peerId);
+      changed = true;
+    }
+    if (this.peerUsernames.has(peerId)) {
+      this.peerUsernames.delete(peerId);
+      changed = true;
+    }
+    if (this.peerLastSeen.has(peerId)) {
+      this.peerLastSeen.delete(peerId);
+      changed = true;
+    }
+
+    if (changed) {
+      this.emitPeersChange();
+    }
+  }
+
+  private startHeartbeat() {
+    this.stopHeartbeat();
+
+    // Send heartbeat periodically to all peers
+    this.heartbeatTimer = setInterval(() => {
+      if (this.isDisconnected) return;
+      this.broadcast({ type: 'HEARTBEAT', peerId: this.getMyPeerId() });
+    }, this.HEARTBEAT_INTERVAL_MS);
+
+    // Check for stale peers that haven't sent a heartbeat recently
+    this.staleCheckTimer = setInterval(() => {
+      if (this.isDisconnected) return;
+      const now = Date.now();
+      this.peerLastSeen.forEach((lastSeen, peerId) => {
+        if (now - lastSeen > this.STALE_TIMEOUT_MS) {
+          console.warn(`Peer ${peerId} timed out (no heartbeat for ${now - lastSeen}ms). Removing.`);
+          this.handlePeerLeave(peerId);
+        }
+      });
+    }, this.HEARTBEAT_INTERVAL_MS);
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (this.staleCheckTimer) {
+      clearInterval(this.staleCheckTimer);
+      this.staleCheckTimer = null;
+    }
   }
 
   private emitPeersChange() {
@@ -177,7 +259,11 @@ export class RoomManager {
   public broadcast(message: PeerMessage) {
     this.dataConnections.forEach((conn) => {
       if (conn.open) {
-        conn.send(message);
+        try {
+          conn.send(message);
+        } catch (e) {
+          console.error("Error sending message to peer:", conn.peer, e);
+        }
       }
     });
   }
@@ -191,13 +277,37 @@ export class RoomManager {
   }
 
   public disconnect() {
+    if (this.isDisconnected) return;
     this.isDisconnected = true;
-    this.dataConnections.forEach(conn => conn.close());
-    this.mediaConnections.forEach(call => call.close());
+
+    window.removeEventListener('beforeunload', this.handleUnload);
+    this.stopHeartbeat();
+
+    const myId = this.getMyPeerId();
+    // Broadcast LEAVE message so connected peers know immediately
+    this.broadcast({ type: 'LEAVE', peerId: myId });
+
+    this.dataConnections.forEach(conn => {
+      try { conn.close(); } catch (_) {}
+    });
+    this.mediaConnections.forEach(call => {
+      try { call.close(); } catch (_) {}
+    });
+
     if (this.localStream) {
       this.localStream.getTracks().forEach(track => track.stop());
     }
-    this.peer?.destroy();
+
+    try {
+      this.peer?.destroy();
+    } catch (_) {}
+
+    this.activePeers.clear();
+    this.peerUsernames.clear();
+    this.peerLastSeen.clear();
+    this.dataConnections.clear();
+    this.mediaConnections.clear();
+    this.emitPeersChange();
   }
 
   public getMyPeerId(): string {

@@ -25,7 +25,7 @@ describe('sanitizeAndParseURLs', () => {
     const input = 'Look at this https://example.com/image.png';
     const result = sanitizeAndParseURLs(input);
     expect(result).toContain('<img src="https://example.com/image.png"');
-    expect(result).toContain('class="message-image"');
+    expect(result).toContain('class="message-image clickable-image"');
   });
 
   it('should parse generic urls', () => {
